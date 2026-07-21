@@ -1,6 +1,6 @@
 # kvstore
 
-A small, persistent key-value store server written in C for Windows.
+A small, persistent WebSocket key-value store server written in C for Windows.
 
 The server stores string keys and values in an in-memory hash table. It also
 writes changes to an append-only log so data is restored when the server starts
@@ -8,7 +8,7 @@ again.
 
 ## Features
 
-- TCP server using Winsock
+- WebSocket server using Winsock
 - One client handled at a time
 - `SET`, `GET`, and `DEL` commands
 - In-memory hash table with automatic resizing
@@ -36,10 +36,10 @@ You may provide a port and persistence-file path:
 .\output\kvstore.exe 6380 mydata.aof
 ```
 
-## Protocol
+## WebSocket protocol
 
-Connect with a TCP client such as `telnet`, `nc`, or your own application. Send
-one command per line.
+Connect a WebSocket client to `ws://localhost:6379`. Send one command in each
+WebSocket text message.
 
 ```text
 PING
@@ -49,7 +49,7 @@ DEL name
 QUIT
 ```
 
-Example responses:
+Example responses are also WebSocket text messages:
 
 ```text
 PONG
@@ -61,6 +61,18 @@ BYE
 
 Keys cannot contain spaces. Values may contain spaces, but cannot contain a
 newline.
+
+Browser example:
+
+```javascript
+const store = new WebSocket("ws://localhost:6379");
+
+store.onmessage = (event) => console.log(event.data);
+store.onopen = () => {
+  store.send("SET name Alice");
+  store.send("GET name");
+};
+```
 
 ## Persistence
 
