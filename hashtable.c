@@ -3,45 +3,118 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define LOAD_FACTOR 0.7
 
-//djb2 hash function
+/* Forward declarations: delete_at() needs to reinsert shifted entries during
+   open-addressing deletion, and ht_insert_internal() needs to trigger a
+   resize, so each is used before the other is defined below. */
+static int ht_insert_internal(HashTable* ht, const char* key, const char* value, long long expireAtMs);
+static int ht_resize(HashTable* ht);
+
+/* djb2 hash function */
 static size_t hash(const char* key, size_t capacity)
 {
-    unsigned long hash = 5381;
+    unsigned long h = 5381;
     int c;
 
     while ((c = *key++))
-    {
-        hash = ((hash << 5) + hash) + c; 
-    }
+        h = ((h << 5) + h) + c;
 
-    return hash % capacity;
-
+    return h % capacity;
 }
 
 static char* copy_string(const char* str)
 {
-        size_t len = strlen(str) + 1;
+    size_t len = strlen(str) + 1;
     char* copy = malloc(len);
 
     if (copy == NULL)
         return NULL;
 
-    memcpy(copy, str, len); 
+    memcpy(copy, str, len);
     return copy;
+}
 
+long long ht_current_time_ms(void)
+{
+    /* Second-granularity is all EXPIRE/TTL need, and this avoids pulling in
+       Windows-specific time APIs so hashtable.c stays platform-neutral. */
+    return (long long)time(NULL) * 1000;
+}
+
+static int is_expired(const HashNode* node, long long nowMs)
+{
+    return node->expireAtMs != 0 && node->expireAtMs <= nowMs;
+}
+
+/* Finds the slot holding key, ignoring expiry. Returns NULL if key isn't in
+   the table at all. Callers are responsible for checking is_expired() on
+   whatever they get back, since "present but expired" and "absent" usually
+   need different handling (lazy deletion vs. a plain miss). */
+static HashNode* find_node(HashTable* ht, const char* key)
+{
+    size_t index = hash(key, ht->capacity);
+    size_t start = index;
+
+    while (ht->table[index].occupied)
+    {
+        if (strcmp(ht->table[index].key, key) == 0)
+            return &ht->table[index];
+
+        index = (index + 1) % ht->capacity;
+        if (index == start)
+            break;
+    }
+
+    return NULL;
+}
+
+/* Frees the slot at index and closes the open-addressing probe chain that
+   follows it, matching the table's original backward-shift deletion
+   algorithm. Assumes ht->table[index].occupied is true on entry. */
+static void delete_at(HashTable* ht, size_t index)
+{
+    size_t next;
+
+    free(ht->table[index].key);
+    free(ht->table[index].value);
+    ht->table[index].key = NULL;
+    ht->table[index].value = NULL;
+    ht->table[index].expireAtMs = 0;
+    ht->table[index].occupied = 0;
+    ht->size--;
+
+    next = (index + 1) % ht->capacity;
+    while (ht->table[next].occupied)
+    {
+        HashNode temp = ht->table[next];
+
+        ht->table[next].key = NULL;
+        ht->table[next].value = NULL;
+        ht->table[next].expireAtMs = 0;
+        ht->table[next].occupied = 0;
+        ht->size--;
+
+        /* Preserve the shifted entry's TTL -- this is an internal reshuffle,
+           not a client SET, so it must not reset the key's expiry. */
+        ht_insert_internal(ht, temp.key, temp.value, temp.expireAtMs);
+        free(temp.key);
+        free(temp.value);
+
+        next = (next + 1) % ht->capacity;
+    }
 }
 
 static int ht_resize(HashTable* ht)
 {
-    size_t oldCapacity = ht->capacity; //(*ht).capacity
+    size_t oldCapacity = ht->capacity;
     HashNode* oldTable = ht->table;
-
     size_t newCapacity = oldCapacity * 2;
-
     HashNode* newTable = calloc(newCapacity, sizeof(HashNode));
+    long long now = ht_current_time_ms();
+    size_t i;
 
     if (newTable == NULL)
         return 0;
@@ -50,19 +123,29 @@ static int ht_resize(HashTable* ht)
     ht->capacity = newCapacity;
     ht->size = 0;
 
-    for (size_t i = 0; i < oldCapacity; i++)
+    for (i = 0; i < oldCapacity; i++)
     {
-        if (oldTable[i].occupied)
+        if (!oldTable[i].occupied)
+            continue;
+
+        /* Drop already-expired keys here instead of carrying them forward --
+           a resize is a convenient, free opportunity to reclaim that memory. */
+        if (is_expired(&oldTable[i], now))
+        {
+            free(oldTable[i].key);
+            free(oldTable[i].value);
+            continue;
+        }
+
         {
             size_t index = hash(oldTable[i].key, ht->capacity);
 
             while (ht->table[index].occupied)
-            {
                 index = (index + 1) % ht->capacity;
-            }
 
             ht->table[index].key = oldTable[i].key;
             ht->table[index].value = oldTable[i].value;
+            ht->table[index].expireAtMs = oldTable[i].expireAtMs;
             ht->table[index].occupied = 1;
 
             ht->size++;
@@ -74,9 +157,8 @@ static int ht_resize(HashTable* ht)
     return 1;
 }
 
-HashTable* ht_create()
+HashTable* ht_create(void)
 {
-
     HashTable* ht = malloc(sizeof(HashTable));
 
     if (ht == NULL)
@@ -84,7 +166,6 @@ HashTable* ht_create()
 
     ht->capacity = 16;
     ht->size = 0;
-
     ht->table = calloc(16, sizeof(HashNode));
 
     if (ht->table == NULL)
@@ -98,10 +179,12 @@ HashTable* ht_create()
 
 void ht_destroy(HashTable* ht)
 {
+    size_t i;
+
     if (ht == NULL)
         return;
 
-    for (size_t i = 0; i < ht->capacity; i++)
+    for (i = 0; i < ht->capacity; i++)
     {
         if (ht->table[i].occupied)
         {
@@ -114,15 +197,19 @@ void ht_destroy(HashTable* ht)
     free(ht);
 }
 
-int ht_insert(HashTable* ht, const char* key, const char* value)
+static int ht_insert_internal(HashTable* ht, const char* key, const char* value, long long expireAtMs)
 {
+    size_t index;
+    char* keyCopy;
+    char* valueCopy;
+
     if ((double)ht->size / ht->capacity > LOAD_FACTOR)
     {
         if (!ht_resize(ht))
             return 0;
     }
 
-    size_t index = hash(key, ht->capacity);
+    index = hash(key, ht->capacity);
 
     while (ht->table[index].occupied)
     {
@@ -135,14 +222,15 @@ int ht_insert(HashTable* ht, const char* key, const char* value)
 
             free(ht->table[index].value);
             ht->table[index].value = newValue;
+            ht->table[index].expireAtMs = expireAtMs;
             return 1;
         }
 
         index = (index + 1) % ht->capacity;
     }
 
-    char* keyCopy = copy_string(key);
-    char* valueCopy = copy_string(value);
+    keyCopy = copy_string(key);
+    valueCopy = copy_string(value);
 
     if (keyCopy == NULL || valueCopy == NULL)
     {
@@ -153,6 +241,7 @@ int ht_insert(HashTable* ht, const char* key, const char* value)
 
     ht->table[index].key = keyCopy;
     ht->table[index].value = valueCopy;
+    ht->table[index].expireAtMs = expireAtMs;
     ht->table[index].occupied = 1;
 
     ht->size++;
@@ -160,80 +249,157 @@ int ht_insert(HashTable* ht, const char* key, const char* value)
     return 1;
 }
 
+int ht_insert(HashTable* ht, const char* key, const char* value)
+{
+    /* Plain SET clears any existing TTL, matching Redis's default behavior. */
+    return ht_insert_internal(ht, key, value, 0);
+}
+
+int ht_insert_keep_ttl(HashTable* ht, const char* key, const char* value)
+{
+    HashNode* existing = find_node(ht, key);
+    long long expireAtMs = 0;
+
+    if (existing != NULL && !is_expired(existing, ht_current_time_ms()))
+        expireAtMs = existing->expireAtMs;
+
+    return ht_insert_internal(ht, key, value, expireAtMs);
+}
+
 char* ht_search(HashTable* ht, const char* key)
 {
-    size_t index = hash(key, ht->capacity);
-    size_t start = index;
+    HashNode* node = find_node(ht, key);
 
-    while (ht->table[index].occupied)
+    if (node == NULL)
+        return NULL;
+
+    if (is_expired(node, ht_current_time_ms()))
     {
-        if (strcmp(ht->table[index].key, key) == 0)
-            return ht->table[index].value;
-
-        index = (index + 1) % ht->capacity;
-
-        if (index == start)
-            break;
+        delete_at(ht, (size_t)(node - ht->table));
+        return NULL;
     }
 
-    return NULL;
+    return node->value;
 }
 
 int ht_remove(HashTable* ht, const char* key)
 {
-    size_t index = hash(key, ht->capacity);
-    size_t start = index;
+    HashNode* node = find_node(ht, key);
 
-    while (ht->table[index].occupied)
+    if (node == NULL)
+        return 0;
+
+    if (is_expired(node, ht_current_time_ms()))
     {
-        if (strcmp(ht->table[index].key, key) == 0)
-        {
-            free(ht->table[index].key);
-            free(ht->table[index].value);
-
-            ht->table[index].occupied = 0;
-            ht->size--;
-
-            size_t next = (index + 1) % ht->capacity;
-
-            while (ht->table[next].occupied)
-            {
-                HashNode temp = ht->table[next];
-
-                ht->table[next].occupied = 0;
-                ht->size--;
-
-                ht_insert(ht, temp.key, temp.value);
-                free(temp.key);
-                free(temp.value);
-
-                next = (next + 1) % ht->capacity;
-            }
-
-            return 1;
-        }
-
-        index = (index + 1) % ht->capacity;
-
-        if (index == start)
-            break;
+        /* Already effectively gone -- clean it up, but this DEL didn't
+           "remove" a live key, so report failure like a normal miss. */
+        delete_at(ht, (size_t)(node - ht->table));
+        return 0;
     }
 
-    return 0;
+    delete_at(ht, (size_t)(node - ht->table));
+    return 1;
+}
+
+int ht_set_expiry(HashTable* ht, const char* key, long long expireAtMs)
+{
+    HashNode* node = find_node(ht, key);
+
+    if (node == NULL)
+        return 0;
+
+    if (is_expired(node, ht_current_time_ms()))
+    {
+        delete_at(ht, (size_t)(node - ht->table));
+        return 0;
+    }
+
+    node->expireAtMs = expireAtMs;
+    return 1;
+}
+
+int ht_persist(HashTable* ht, const char* key)
+{
+    return ht_set_expiry(ht, key, 0);
+}
+
+int ht_get_expiry(HashTable* ht, const char* key, long long* outExpireAtMs)
+{
+    HashNode* node = find_node(ht, key);
+
+    if (node == NULL)
+        return 0;
+
+    if (is_expired(node, ht_current_time_ms()))
+    {
+        delete_at(ht, (size_t)(node - ht->table));
+        return 0;
+    }
+
+    if (outExpireAtMs != NULL)
+        *outExpireAtMs = node->expireAtMs;
+
+    return 1;
+}
+
+size_t ht_sweep_expired(HashTable* ht)
+{
+    long long now = ht_current_time_ms();
+    size_t removed = 0;
+    size_t i = 0;
+
+    while (i < ht->capacity)
+    {
+        if (ht->table[i].occupied && is_expired(&ht->table[i], now))
+        {
+            /* delete_at() may shift a later probe-chain entry back into slot
+               i, so re-examine the same index rather than advancing past it. */
+            delete_at(ht, i);
+            ++removed;
+            continue;
+        }
+        ++i;
+    }
+
+    return removed;
+}
+
+void ht_for_each(HashTable* ht, HtVisitor callback, void* userData)
+{
+    long long now = ht_current_time_ms();
+    size_t i;
+
+    for (i = 0; i < ht->capacity; i++)
+    {
+        if (ht->table[i].occupied && !is_expired(&ht->table[i], now))
+            callback(ht->table[i].key, ht->table[i].value, ht->table[i].expireAtMs, userData);
+    }
 }
 
 void ht_print(HashTable* ht)
 {
+    size_t i;
+    long long now = ht_current_time_ms();
+
     printf("\nHash Table\n");
     printf("-----------------------\n");
 
-    for (size_t i = 0; i < ht->capacity; i++)
+    for (i = 0; i < ht->capacity; i++)
     {
-        if (ht->table[i].occupied)
-            printf("[%zu] %s -> %s\n", i, ht->table[i].key,
-                ht->table[i].value);
-        else
+        if (!ht->table[i].occupied)
+        {
             printf("[%zu] EMPTY\n", i);
+            continue;
+        }
+
+        if (ht->table[i].expireAtMs == 0)
+            printf("[%zu] %s -> %s\n", i, ht->table[i].key, ht->table[i].value);
+        else
+        {
+            long long remainingMs = ht->table[i].expireAtMs - now;
+            printf("[%zu] %s -> %s (expires in %lldms)\n", i, ht->table[i].key,
+                   ht->table[i].value, remainingMs);
+        }
     }
 
     printf("-----------------------\n");

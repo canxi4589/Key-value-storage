@@ -1,13 +1,14 @@
-
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <io.h>
+#include <process.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "Header/hashtable.h"
+#include "Header/persistence.h"
 
 #ifdef _MSC_VER
 #pragma comment(lib, "Ws2_32.lib")
@@ -16,7 +17,108 @@
 #define DEFAULT_PORT "6379"
 #define DEFAULT_DATA_FILE "kvstore.aof"
 #define MAX_LINE 4096
-#define MAX_HTTP_REQUEST 8192
+#define RECV_TIMEOUT_MS 30000
+#define SWEEP_INTERVAL_MS 1000
+
+#define MAX_ARGS 8            /* Longest command (EXPIRE key seconds) needs 3 */
+#define MAX_ARG_LEN 4096
+#define READ_BUF_SIZE 8192
+
+/* Guards all access to the shared HashTable and the AOF data file, since
+   multiple client threads (plus the background sweep thread) may touch them
+   concurrently. */
+static CRITICAL_SECTION g_storeLock;
+
+typedef struct
+{
+    SOCKET client;
+    HashTable* store;
+    const char* dataFile;
+} ClientContext;
+
+/* A small buffered reader over a socket. RESP parsing needs to read a mix of
+   CRLF-terminated lines and fixed-length byte blocks, so we keep a chunk of
+   already-received bytes around instead of issuing a recv() per byte. */
+typedef struct
+{
+    SOCKET sock;
+    char buf[READ_BUF_SIZE];
+    int len;   /* valid bytes currently in buf */
+    int pos;   /* next unread byte in buf */
+} BufReader;
+
+typedef struct
+{
+    char argv[MAX_ARGS][MAX_ARG_LEN];
+    int argc;
+} Command;
+
+static void br_init(BufReader* r, SOCKET sock)
+{
+    r->sock = sock;
+    r->len = 0;
+    r->pos = 0;
+}
+
+/* Ensures at least one unread byte is available, blocking on recv() if the
+   local buffer is empty. Returns 0 on EOF/error/timeout. */
+static int br_fill(BufReader* r)
+{
+    if (r->pos < r->len)
+        return 1;
+    r->len = recv(r->sock, r->buf, sizeof(r->buf), 0);
+    r->pos = 0;
+    return r->len > 0;
+}
+
+static int br_read_byte(BufReader* r, char* out)
+{
+    if (!br_fill(r))
+        return 0;
+    *out = r->buf[r->pos++];
+    return 1;
+}
+
+/* Reads a CRLF-terminated line into out (without the CRLF). Also tolerates a
+   bare '\n', since some simple clients/tools don't send '\r'. */
+static int br_read_line(BufReader* r, char* out, size_t outSize)
+{
+    size_t i = 0;
+
+    while (i + 1 < outSize)
+    {
+        char c;
+        if (!br_read_byte(r, &c))
+            return 0;
+        if (c == '\n')
+        {
+            if (i > 0 && out[i - 1] == '\r')
+                --i;
+            out[i] = '\0';
+            return 1;
+        }
+        out[i++] = c;
+    }
+    return 0; /* line too long */
+}
+
+static int br_read_n(BufReader* r, char* out, size_t n)
+{
+    size_t got = 0;
+
+    while (got < n)
+    {
+        size_t avail, take;
+        if (!br_fill(r))
+            return 0;
+        avail = (size_t)(r->len - r->pos);
+        take = avail < (n - got) ? avail : (n - got);
+        memcpy(out + got, r->buf + r->pos, take);
+        r->pos += (int)take;
+        got += take;
+    }
+    return 1;
+}
 
 static int send_raw(SOCKET client, const char* data, size_t length)
 {
@@ -34,336 +136,355 @@ static int send_raw(SOCKET client, const char* data, size_t length)
     return 1;
 }
 
-static int recv_exact(SOCKET client, void* buffer, size_t length)
-{
-    char* cursor = buffer;
-    size_t remaining = length;
+/* ---- RESP reply helpers -------------------------------------------------
+   See https://redis.io/docs/latest/develop/reference/protocol-spec/ for the
+   wire format. We only need simple strings, errors, bulk strings, and
+   integers. */
 
-    while (remaining > 0)
+static int resp_send_simple(SOCKET client, const char* text)
+{
+    char line[MAX_LINE + 8];
+    int n = snprintf(line, sizeof(line), "+%s\r\n", text);
+    return n > 0 && (size_t)n < sizeof(line) && send_raw(client, line, (size_t)n);
+}
+
+static int resp_send_error(SOCKET client, const char* text)
+{
+    char line[MAX_LINE + 8];
+    int n = snprintf(line, sizeof(line), "-%s\r\n", text);
+    return n > 0 && (size_t)n < sizeof(line) && send_raw(client, line, (size_t)n);
+}
+
+static int resp_send_bulk(SOCKET client, const char* data)
+{
+    char header[32];
+    size_t length = strlen(data);
+    int n = snprintf(header, sizeof(header), "$%zu\r\n", length);
+
+    if (n <= 0 || (size_t)n >= sizeof(header))
+        return 0;
+    return send_raw(client, header, (size_t)n) &&
+           send_raw(client, data, length) &&
+           send_raw(client, "\r\n", 2);
+}
+
+static int resp_send_nil(SOCKET client)
+{
+    return send_raw(client, "$-1\r\n", 5);
+}
+
+static int resp_send_integer(SOCKET client, long long value)
+{
+    char line[32];
+    int n = snprintf(line, sizeof(line), ":%lld\r\n", value);
+
+    if (n <= 0 || (size_t)n >= sizeof(line))
+        return 0;
+    return send_raw(client, line, (size_t)n);
+}
+
+/* ---- RESP / inline command parsing -------------------------------------- */
+
+/* Reads one command from the connection into cmd. Supports:
+   - RESP arrays of bulk strings: *2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n
+     (this is what redis-cli and every real client library sends)
+   - Inline commands: plain text lines like "PING\r\n" or "SET a b\r\n"
+     (this is what telnet/nc and real Redis's inline protocol use)
+   Returns 0 on disconnect, timeout, protocol error, or too many/long args. */
+static int read_command(BufReader* r, Command* cmd)
+{
+    char line[64];
+
+    if (!br_read_line(r, line, sizeof(line)))
+        return 0;
+
+    if (line[0] == '*')
     {
-        int received = recv(client, cursor, (int)remaining, 0);
-        if (received <= 0)
+        int count = atoi(line + 1);
+        int i;
+
+        if (count <= 0 || count > MAX_ARGS)
             return 0;
-        cursor += received;
-        remaining -= (size_t)received;
-    }
-    return 1;
-}
+        cmd->argc = count;
 
-static void sha1(const unsigned char* input, size_t length, unsigned char digest[20])
-{
-    unsigned int h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE;
-    unsigned int h3 = 0x10325476, h4 = 0xC3D2E1F0;
-    unsigned char padded[128] = { 0 };
-    size_t paddedLength = ((length + 9 + 63) / 64) * 64;
-    unsigned long long bits = (unsigned long long)length * 8;
-
-    /* This server only hashes the short WebSocket handshake value. */
-    memcpy(padded, input, length);
-    padded[length] = 0x80;
-    for (int i = 0; i < 8; ++i)
-        padded[paddedLength - 1 - i] = (unsigned char)(bits >> (i * 8));
-
-    for (size_t offset = 0; offset < paddedLength; offset += 64)
-    {
-        unsigned int w[80];
-        unsigned int a, b, c, d, e;
-
-        for (int i = 0; i < 16; ++i)
-            w[i] = ((unsigned int)padded[offset + i * 4] << 24) |
-                   ((unsigned int)padded[offset + i * 4 + 1] << 16) |
-                   ((unsigned int)padded[offset + i * 4 + 2] << 8) |
-                   padded[offset + i * 4 + 3];
-        for (int i = 16; i < 80; ++i)
+        for (i = 0; i < count; ++i)
         {
-            unsigned int x = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
-            w[i] = (x << 1) | (x >> 31);
+            char lenLine[32];
+            int argLen;
+            char crlf[2];
+
+            if (!br_read_line(r, lenLine, sizeof(lenLine)) || lenLine[0] != '$')
+                return 0;
+            argLen = atoi(lenLine + 1);
+            if (argLen < 0 || argLen >= MAX_ARG_LEN)
+                return 0;
+            if (!br_read_n(r, cmd->argv[i], (size_t)argLen))
+                return 0;
+            cmd->argv[i][argLen] = '\0';
+            if (!br_read_n(r, crlf, 2)) /* trailing CRLF after each bulk string */
+                return 0;
         }
-        a = h0; b = h1; c = h2; d = h3; e = h4;
-        for (int i = 0; i < 80; ++i)
+        return 1;
+    }
+
+    /* Inline command: whitespace-separated tokens on one line. */
+    {
+        char* token = strtok(line, " \t");
+        cmd->argc = 0;
+        while (token != NULL && cmd->argc < MAX_ARGS)
         {
-            unsigned int f, k, temp;
-            if (i < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
-            else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
-            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
-            else { f = b ^ c ^ d; k = 0xCA62C1D6; }
-            temp = ((a << 5) | (a >> 27)) + f + e + k + w[i];
-            e = d; d = c; c = (b << 30) | (b >> 2); b = a; a = temp;
+            strncpy(cmd->argv[cmd->argc], token, MAX_ARG_LEN - 1);
+            cmd->argv[cmd->argc][MAX_ARG_LEN - 1] = '\0';
+            ++cmd->argc;
+            token = strtok(NULL, " \t");
         }
-        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
+        return cmd->argc > 0;
     }
-    digest[0] = (unsigned char)(h0 >> 24); digest[1] = (unsigned char)(h0 >> 16);
-    digest[2] = (unsigned char)(h0 >> 8);  digest[3] = (unsigned char)h0;
-    digest[4] = (unsigned char)(h1 >> 24); digest[5] = (unsigned char)(h1 >> 16);
-    digest[6] = (unsigned char)(h1 >> 8);  digest[7] = (unsigned char)h1;
-    digest[8] = (unsigned char)(h2 >> 24); digest[9] = (unsigned char)(h2 >> 16);
-    digest[10] = (unsigned char)(h2 >> 8); digest[11] = (unsigned char)h2;
-    digest[12] = (unsigned char)(h3 >> 24); digest[13] = (unsigned char)(h3 >> 16);
-    digest[14] = (unsigned char)(h3 >> 8); digest[15] = (unsigned char)h3;
-    digest[16] = (unsigned char)(h4 >> 24); digest[17] = (unsigned char)(h4 >> 16);
-    digest[18] = (unsigned char)(h4 >> 8); digest[19] = (unsigned char)h4;
-}
-
-static void base64_encode(const unsigned char* input, size_t length, char* output)
-{
-    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    size_t in = 0, out = 0;
-
-    while (in < length)
-    {
-        unsigned int value = (unsigned int)input[in++] << 16;
-        int haveSecond = in < length;
-        int haveThird;
-        if (haveSecond) value |= (unsigned int)input[in++] << 8;
-        haveThird = in < length;
-        if (haveThird) value |= input[in++];
-        output[out++] = alphabet[(value >> 18) & 63];
-        output[out++] = alphabet[(value >> 12) & 63];
-        output[out++] = haveSecond ? alphabet[(value >> 6) & 63] : '=';
-        output[out++] = haveThird ? alphabet[value & 63] : '=';
-    }
-    output[out] = '\0';
-}
-
-static int send_websocket_frame(SOCKET client, unsigned char opcode, const char* data, size_t length)
-{
-    unsigned char header[4];
-    size_t headerLength = 2;
-
-    if (length > MAX_LINE || length > 65535)
-        return 0;
-    header[0] = 0x80 | opcode;
-    if (length < 126)
-        header[1] = (unsigned char)length;
-    else
-    {
-        header[1] = 126;
-        header[2] = (unsigned char)(length >> 8);
-        header[3] = (unsigned char)length;
-        headerLength = 4;
-    }
-    return send_raw(client, (const char*)header, headerLength) && send_raw(client, data, length);
-}
-
-static int send_text(SOCKET client, const char* text)
-{
-    return send_websocket_frame(client, 0x1, text, strlen(text));
-}
-
-static int websocket_handshake(SOCKET client)
-{
-    char request[MAX_HTTP_REQUEST + 1];
-    size_t length = 0;
-    char ch;
-    char* keyStart;
-    char* keyEnd;
-    char source[128];
-    unsigned char digest[20];
-    char acceptKey[32];
-    char response[256];
-    const char* magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-    while (length < MAX_HTTP_REQUEST && recv(client, &ch, 1, 0) == 1)
-    {
-        request[length++] = ch;
-        if (length >= 4 && memcmp(request + length - 4, "\r\n\r\n", 4) == 0)
-            break;
-    }
-    request[length] = '\0';
-    keyStart = strstr(request, "Sec-WebSocket-Key:");
-    if (strncmp(request, "GET ", 4) != 0 || keyStart == NULL)
-        return 0;
-    keyStart += strlen("Sec-WebSocket-Key:");
-    while (*keyStart == ' ' || *keyStart == '\t') ++keyStart;
-    keyEnd = strpbrk(keyStart, "\r\n");
-    if (keyEnd == NULL || (size_t)(keyEnd - keyStart) + strlen(magic) >= 120)
-        return 0;
-    memcpy(source, keyStart, (size_t)(keyEnd - keyStart));
-    strcpy(source + (keyEnd - keyStart), magic);
-    sha1((const unsigned char*)source, strlen(source), digest);
-    base64_encode(digest, sizeof(digest), acceptKey);
-    snprintf(response, sizeof(response),
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: %s\r\n\r\n", acceptKey);
-    return send_raw(client, response, strlen(response));
-}
-
-static int receive_websocket_text(SOCKET client, char* output, size_t outputSize,
-                                  unsigned char* opcode)
-{
-    unsigned char header[2], mask[4];
-    size_t length;
-
-    if (!recv_exact(client, header, sizeof(header)) || (header[0] & 0x80) == 0 ||
-        (header[1] & 0x80) == 0)
-        return 0;
-    *opcode = header[0] & 0x0F;
-    length = header[1] & 0x7F;
-    if (length == 126)
-    {
-        unsigned char extended[2];
-        if (!recv_exact(client, extended, sizeof(extended))) return 0;
-        length = ((size_t)extended[0] << 8) | extended[1];
-    }
-    else if (length == 127)
-        return 0; /* This small server intentionally caps messages at 4 KiB. */
-    if (length >= outputSize || !recv_exact(client, mask, sizeof(mask)) ||
-        !recv_exact(client, output, length))
-        return 0;
-    for (size_t i = 0; i < length; ++i)
-        output[i] ^= mask[i % 4];
-    output[length] = '\0';
-    return 1;
 }
 
 static int valid_key(const char* key)
 {
-    return key != NULL && *key != '\0' && strpbrk(key, " \t\r\n") == NULL;
+    return key != NULL && *key != '\0';
 }
 
-static int append_command(const char* dataFile, const char* command, const char* key,
-                          const char* value)
+/* Uppercases in place so commands are case-insensitive, matching real Redis
+   ("get", "Get", and "GET" are all the same command). */
+static void uppercase(char* s)
 {
-    FILE* file = fopen(dataFile, "a");
-    if (file == NULL)
+    for (; *s != '\0'; ++s)
+        *s = (char)toupper((unsigned char)*s);
+}
+
+/* Parses a non-negative integer (used for EXPIRE's seconds argument).
+   Returns 1 and sets *out on success; returns 0 if text isn't a clean
+   non-negative integer. */
+static int parse_non_negative(const char* text, long* out)
+{
+    char* endptr;
+    long value = strtol(text, &endptr, 10);
+
+    if (text[0] == '\0' || *endptr != '\0' || value < 0)
         return 0;
 
-    int ok = value == NULL
-        ? fprintf(file, "%s %s\n", command, key) > 0
-        : fprintf(file, "%s %s %s\n", command, key, value) > 0;
-
-    if (ok && fflush(file) != 0)
-        ok = 0;
-    if (ok && _commit(_fileno(file)) != 0)
-        ok = 0;
-
-    fclose(file);
-    return ok;
-}
-
-static void apply_command(HashTable* store, char* line)
-{
-    char* command = strtok(line, " \t");
-    char* key = strtok(NULL, " \t");
-    char* value = strtok(NULL, "");
-
-    if (command == NULL || key == NULL)
-        return;
-    if (strcmp(command, "SET") == 0 && value != NULL)
-        ht_insert(store, key, value);
-    else if (strcmp(command, "DEL") == 0 && value == NULL)
-        ht_remove(store, key);
-}
-
-static int load_data(HashTable* store, const char* dataFile)
-{
-    FILE* file = fopen(dataFile, "r");
-    char line[MAX_LINE];
-
-    if (file == NULL)
-        return 1; /* No data file yet is normal. */
-
-    while (fgets(line, sizeof(line), file) != NULL)
-    {
-        line[strcspn(line, "\r\n")] = '\0';
-        apply_command(store, line);
-    }
-
-    fclose(file);
+    *out = value;
     return 1;
 }
 
-static void handle_line(SOCKET client, HashTable* store, const char* dataFile, char* line)
+static void handle_command(SOCKET client, HashTable* store, const char* dataFile, Command* cmd)
 {
-    char* command = strtok(line, " \t");
-    char* key = strtok(NULL, " \t");
-    char* value = strtok(NULL, "");
+    const char* command = cmd->argv[0];
+    const char* key = cmd->argc > 1 ? cmd->argv[1] : NULL;
+    const char* value = cmd->argc > 2 ? cmd->argv[2] : NULL;
 
-    if (command == NULL)
-        return;
-    if (strcmp(command, "PING") == 0 && key == NULL)
+    uppercase(cmd->argv[0]);
+
+    if (strcmp(command, "PING") == 0 && cmd->argc == 1)
     {
-        send_text(client, "PONG\n");
+        resp_send_simple(client, "PONG");
     }
-    else if (strcmp(command, "GET") == 0 && valid_key(key) && value == NULL)
+    else if (strcmp(command, "GET") == 0 && cmd->argc == 2 && valid_key(key))
     {
-        char* found = ht_search(store, key);
-        if (found == NULL)
-            send_text(client, "NOT_FOUND\n");
-        else
+        char found[MAX_ARG_LEN];
+        int found_flag;
+
+        EnterCriticalSection(&g_storeLock);
         {
-            char response[MAX_LINE + 16];
-            snprintf(response, sizeof(response), "VALUE %s\n", found);
-            send_text(client, response);
+            char* result = ht_search(store, key);
+            found_flag = result != NULL;
+            if (found_flag)
+            {
+                strncpy(found, result, sizeof(found) - 1);
+                found[sizeof(found) - 1] = '\0';
+            }
         }
+        LeaveCriticalSection(&g_storeLock);
+
+        if (found_flag)
+            resp_send_bulk(client, found);
+        else
+            resp_send_nil(client);
     }
-    else if (strcmp(command, "SET") == 0 && valid_key(key) && value != NULL && *value != '\0')
+    else if (strcmp(command, "SET") == 0 && cmd->argc == 3 && valid_key(key) && *value != '\0')
     {
+        const char* okReply = NULL;
+        const char* errReply = NULL;
+
+        EnterCriticalSection(&g_storeLock);
         if (!ht_insert(store, key, value))
-            send_text(client, "ERROR out of memory\n");
-        else if (!append_command(dataFile, "SET", key, value))
-            send_text(client, "ERROR could not persist value\n");
+            errReply = "ERR out of memory";
+        else if (!aof_append(dataFile, "SET", key, value))
+            errReply = "ERR could not persist value";
         else
-            send_text(client, "OK\n");
+            okReply = "OK";
+        LeaveCriticalSection(&g_storeLock);
+
+        if (errReply != NULL)
+            resp_send_error(client, errReply);
+        else
+            resp_send_simple(client, okReply);
     }
-    else if (strcmp(command, "DEL") == 0 && valid_key(key) && value == NULL)
+    else if (strcmp(command, "DEL") == 0 && cmd->argc == 2 && valid_key(key))
     {
-        if (ht_search(store, key) == NULL)
-            send_text(client, "NOT_FOUND\n");
-        else if (!append_command(dataFile, "DEL", key, NULL))
-            send_text(client, "ERROR could not persist deletion\n");
+        int deleted = 0;
+        const char* errReply = NULL;
+
+        EnterCriticalSection(&g_storeLock);
+        if (ht_search(store, key) != NULL)
+        {
+            if (!aof_append(dataFile, "DEL", key, NULL))
+                errReply = "ERR could not persist deletion";
+            else
+            {
+                ht_remove(store, key);
+                deleted = 1;
+            }
+        }
+        LeaveCriticalSection(&g_storeLock);
+
+        if (errReply != NULL)
+            resp_send_error(client, errReply);
+        else
+            /* Real Redis replies to DEL with the count of keys removed;
+               we only ever delete at most one, so it's 0 or 1. */
+            resp_send_integer(client, deleted ? 1 : 0);
+    }
+    else if (strcmp(command, "EXPIRE") == 0 && cmd->argc == 3 && valid_key(key))
+    {
+        long seconds;
+
+        if (!parse_non_negative(value, &seconds))
+        {
+            resp_send_error(client, "ERR value is not an integer or out of range");
+        }
         else
         {
-            ht_remove(store, key);
-            send_text(client, "OK\n");
+            long long expireAtMs = ht_current_time_ms() + (long long)seconds * 1000;
+            int exists;
+            const char* errReply = NULL;
+
+            EnterCriticalSection(&g_storeLock);
+            exists = ht_set_expiry(store, key, expireAtMs);
+            if (exists && !aof_log_expire(dataFile, key, expireAtMs))
+                errReply = "ERR could not persist expiry";
+            LeaveCriticalSection(&g_storeLock);
+
+            if (errReply != NULL)
+                resp_send_error(client, errReply);
+            else
+                /* Matches real Redis: 1 if the timeout was set, 0 if the key
+                   doesn't exist (or had already expired). */
+                resp_send_integer(client, exists ? 1 : 0);
         }
     }
-    else if (strcmp(command, "QUIT") == 0 && key == NULL)
+    else if (strcmp(command, "TTL") == 0 && cmd->argc == 2 && valid_key(key))
     {
-        send_text(client, "BYE\n");
+        long long expireAtMs = 0;
+        int exists;
+        long long remainingSeconds;
+
+        EnterCriticalSection(&g_storeLock);
+        exists = ht_get_expiry(store, key, &expireAtMs);
+        LeaveCriticalSection(&g_storeLock);
+
+        if (!exists)
+            remainingSeconds = -2; /* key doesn't exist (or just expired) */
+        else if (expireAtMs == 0)
+            remainingSeconds = -1; /* key exists but has no TTL */
+        else
+        {
+            long long remainingMs = expireAtMs - ht_current_time_ms();
+            /* Round up so a key with e.g. 400ms left reports 1s, not 0
+               (0 would misleadingly suggest it's already gone). */
+            remainingSeconds = remainingMs > 0 ? (remainingMs + 999) / 1000 : 0;
+        }
+
+        resp_send_integer(client, remainingSeconds);
+    }
+    else if (strcmp(command, "PERSIST") == 0 && cmd->argc == 2 && valid_key(key))
+    {
+        int changed;
+        const char* errReply = NULL;
+
+        EnterCriticalSection(&g_storeLock);
+        changed = ht_persist(store, key);
+        if (changed && !aof_append(dataFile, "PERSIST", key, NULL))
+            errReply = "ERR could not persist change";
+        LeaveCriticalSection(&g_storeLock);
+
+        if (errReply != NULL)
+            resp_send_error(client, errReply);
+        else
+            /* 1 if a TTL was removed, 0 if the key had none (or doesn't exist). */
+            resp_send_integer(client, changed ? 1 : 0);
+    }
+    else if (strcmp(command, "QUIT") == 0 && cmd->argc == 1)
+    {
+        resp_send_simple(client, "OK");
     }
     else
     {
-        send_text(client, "ERROR commands: PING, GET <key>, SET <key> <value>, DEL <key>, QUIT\n");
+        resp_send_error(client, "ERR unknown command or wrong number of arguments. "
+                                 "Try: PING, GET <key>, SET <key> <value>, DEL <key>, "
+                                 "EXPIRE <key> <seconds>, TTL <key>, PERSIST <key>, QUIT");
     }
 }
 
 static void serve_client(SOCKET client, HashTable* store, const char* dataFile)
 {
-    char line[MAX_LINE];
+    BufReader reader;
+    Command cmd;
 
-    if (!websocket_handshake(client))
-        return;
-
-    send_text(client, "KVSTORE ready. Commands: PING, GET, SET, DEL, QUIT");
+    br_init(&reader, client);
     for (;;)
     {
-        unsigned char opcode;
+        int quitRequested;
 
-        if (!receive_websocket_text(client, line, sizeof(line), &opcode))
+        if (!read_command(&reader, &cmd))
             break;
-        if (opcode == 0x8) /* Close */
-        {
-            send_websocket_frame(client, 0x8, "", 0);
+
+        quitRequested = strcmp(cmd.argv[0], "QUIT") == 0 || strcmp(cmd.argv[0], "quit") == 0;
+        handle_command(client, store, dataFile, &cmd);
+        if (quitRequested)
             break;
-        }
-        if (opcode == 0x9) /* Ping */
-        {
-            send_websocket_frame(client, 0xA, line, strlen(line));
-            continue;
-        }
-        if (opcode == 0x1) /* Text */
-        {
-            int quitRequested = strcmp(line, "QUIT") == 0;
-            handle_line(client, store, dataFile, line);
-            if (quitRequested)
-                break;
-        }
-        else
-            send_text(client, "ERROR text WebSocket messages are required");
     }
+}
+
+/* Thread entry point: one of these runs per connected client, so the accept()
+   loop in main() never blocks waiting on a slow or idle client. */
+static unsigned __stdcall client_thread(void* arg)
+{
+    ClientContext* ctx = (ClientContext*)arg;
+    DWORD timeout = RECV_TIMEOUT_MS;
+
+    /* Prevents one silent/hung client from tying up its thread forever. */
+    setsockopt(ctx->client, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+
+    serve_client(ctx->client, ctx->store, ctx->dataFile);
+
+    closesocket(ctx->client);
+    free(ctx);
+    return 0;
+}
+
+/* Runs for the lifetime of the process, periodically clearing out keys whose
+   TTL has lapsed. Without this, a key that's set with EXPIRE and never
+   looked up again (so ht_search's lazy expiry never triggers) would sit in
+   memory forever. Sweep-driven removals are deliberately NOT logged to the
+   AOF: since EXPIRE always logs an *absolute* timestamp, replaying the log
+   after a restart reconstructs the key with that same already-past
+   timestamp, so it's cleaned up again almost immediately anyway. */
+static unsigned __stdcall expiry_sweep_thread(void* arg)
+{
+    HashTable* store = (HashTable*)arg;
+
+    for (;;)
+    {
+        Sleep(SWEEP_INTERVAL_MS);
+        EnterCriticalSection(&g_storeLock);
+        ht_sweep_expired(store);
+        LeaveCriticalSection(&g_storeLock);
+    }
+    return 0; /* unreachable */
 }
 
 int main(int argc, char* argv[])
@@ -375,13 +496,37 @@ int main(int argc, char* argv[])
     struct addrinfo* address = NULL;
     SOCKET listener = INVALID_SOCKET;
     HashTable* store = ht_create();
+    HANDLE sweepThread;
 
-    if (store == NULL || !load_data(store, dataFile))
+    if (store == NULL || !aof_load(store, dataFile))
     {
         fprintf(stderr, "Could not initialize store.\n");
         ht_destroy(store);
         return 1;
     }
+
+    InitializeCriticalSection(&g_storeLock);
+
+    /* Compact once at startup: the log has just been fully replayed into
+       memory, so this is a cheap opportunity to collapse whatever redundant
+       or expired history built up before the previous shutdown, keeping the
+       next startup's replay fast too. No other thread exists yet, so this
+       runs without lock contention -- EnterCriticalSection here is just
+       future-proofing in case that ever changes. */
+    EnterCriticalSection(&g_storeLock);
+    if (!aof_compact(store, dataFile))
+        fprintf(stderr, "Warning: startup AOF compaction failed; continuing with existing log.\n");
+    LeaveCriticalSection(&g_storeLock);
+
+    sweepThread = (HANDLE)_beginthreadex(NULL, 0, expiry_sweep_thread, store, 0, NULL);
+    if (sweepThread == NULL)
+    {
+        fprintf(stderr, "Could not start expiry sweep thread.\n");
+        ht_destroy(store);
+        return 1;
+    }
+    CloseHandle(sweepThread); /* runs forever; nothing needs to join it */
+
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
     {
         fprintf(stderr, "WSAStartup failed.\n");
@@ -407,14 +552,36 @@ int main(int argc, char* argv[])
     }
     freeaddrinfo(address);
 
-    printf("kvstore listening on port %s; data file: %s\n", port, dataFile);
+    printf("kvstore listening on port %s (RESP/TCP); data file: %s\n", port, dataFile);
     for (;;)
     {
         SOCKET client = accept(listener, NULL, NULL);
-        if (client != INVALID_SOCKET)
+        ClientContext* ctx;
+        HANDLE threadHandle;
+
+        if (client == INVALID_SOCKET)
+            continue;
+
+        ctx = malloc(sizeof(ClientContext));
+        if (ctx == NULL)
         {
-            serve_client(client, store, dataFile);
+            /* Out of memory: reject this connection but keep serving others. */
             closesocket(client);
+            continue;
         }
+        ctx->client = client;
+        ctx->store = store;
+        ctx->dataFile = dataFile;
+
+        threadHandle = (HANDLE)_beginthreadex(NULL, 0, client_thread, ctx, 0, NULL);
+        if (threadHandle == NULL)
+        {
+            closesocket(client);
+            free(ctx);
+            continue;
+        }
+        /* Detach: client_thread cleans up its own socket/context, and main()
+           never blocks on it, so we don't need to keep the handle around. */
+        CloseHandle(threadHandle);
     }
 }
