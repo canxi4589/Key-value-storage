@@ -43,8 +43,8 @@ int ht_remove(HashTable* ht, const char* key);
    not already expired, 0 otherwise. */
 int ht_set_expiry(HashTable* ht, const char* key, long long expireAtMs);
 
-/* Clears any TTL on key, making it persist indefinitely. Returns 1 if the
-   key exists (and was not already expired), 0 otherwise. */
+/* Clears any TTL on key, making it persist indefinitely. Returns 1 only if
+   an existing, non-expired key had a TTL to remove; otherwise returns 0. */
 int ht_persist(HashTable* ht, const char* key);
 
 /* Looks up key's expiration without otherwise affecting it. Returns 0 if the

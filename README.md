@@ -52,6 +52,25 @@ You may provide a port and persistence-file path:
 .\output\kvstore.exe 6380 mydata.aof
 ```
 
+### Authentication
+
+Pass a third argument to require a password for every new connection:
+
+```powershell
+.\output\kvstore.exe 6379 kvstore.aof my-secret-password
+```
+
+When a password is configured, clients must authenticate with `AUTH` before
+using any data command. `QUIT` is always allowed. For example:
+
+```powershell
+redis-cli -p 6379 -a my-secret-password SET name Alice
+```
+
+The password and all traffic are sent in plain text. This is a lightweight
+access gate for trusted networks, not a replacement for TLS or production
+authentication controls. Omit the third argument to leave authentication off.
+
 ## Protocol
 
 The server listens on a plain TCP socket and speaks
@@ -71,6 +90,7 @@ a RESP error:
 
 ```text
 PING
+AUTH <password>
 GET <key>
 SET <key> <value>
 DEL <key>

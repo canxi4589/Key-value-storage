@@ -320,7 +320,22 @@ int ht_set_expiry(HashTable* ht, const char* key, long long expireAtMs)
 
 int ht_persist(HashTable* ht, const char* key)
 {
-    return ht_set_expiry(ht, key, 0);
+    HashNode* node = find_node(ht, key);
+
+    if (node == NULL)
+        return 0;
+
+    if (is_expired(node, ht_current_time_ms()))
+    {
+        delete_at(ht, (size_t)(node - ht->table));
+        return 0;
+    }
+
+    if (node->expireAtMs == 0)
+        return 0;
+
+    node->expireAtMs = 0;
+    return 1;
 }
 
 int ht_get_expiry(HashTable* ht, const char* key, long long* outExpireAtMs)

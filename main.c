@@ -34,6 +34,7 @@ typedef struct
     SOCKET client;
     HashTable* store;
     const char* dataFile;
+    const char* authPassword;
 } ClientContext;
 
 /* A small buffered reader over a socket. RESP parsing needs to read a mix of
@@ -193,7 +194,7 @@ static int resp_send_integer(SOCKET client, long long value)
    Returns 0 on disconnect, timeout, protocol error, or too many/long args. */
 static int read_command(BufReader* r, Command* cmd)
 {
-    char line[64];
+    char line[MAX_LINE];
 
     if (!br_read_line(r, line, sizeof(line)))
         return 0;
@@ -227,18 +228,50 @@ static int read_command(BufReader* r, Command* cmd)
         return 1;
     }
 
-    /* Inline command: whitespace-separated tokens on one line. */
+    /* Inline commands use whitespace to separate the command and key, but
+       preserve the remainder of the line as one value. This lets
+       "SET greeting hello world" store "hello world". Commands other than
+       SET still reject an unexpected third argument in handle_command(). */
     {
-        char* token = strtok(line, " \t");
+        char* cursor = line;
+        int i;
+
         cmd->argc = 0;
-        while (token != NULL && cmd->argc < MAX_ARGS)
+
+        while (*cursor == ' ' || *cursor == '\t')
+            ++cursor;
+        if (*cursor == '\0')
+            return 0;
+
+        /* Command and key are individual whitespace-delimited tokens. */
+        for (i = 0; i < 2; ++i)
         {
-            strncpy(cmd->argv[cmd->argc], token, MAX_ARG_LEN - 1);
+            char* start = cursor;
+
+            while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t')
+                ++cursor;
+
+            strncpy(cmd->argv[cmd->argc], start, (size_t)(cursor - start));
+            cmd->argv[cmd->argc][cursor - start] = '\0';
             cmd->argv[cmd->argc][MAX_ARG_LEN - 1] = '\0';
             ++cmd->argc;
-            token = strtok(NULL, " \t");
+
+            if (*cursor == '\0')
+                return 1;
+
+            *cursor++ = '\0';
+            while (*cursor == ' ' || *cursor == '\t')
+                ++cursor;
+            if (*cursor == '\0')
+                return 1;
         }
-        return cmd->argc > 0;
+
+        /* The rest of the inline line is the value, including internal and
+           trailing spaces. */
+        strncpy(cmd->argv[cmd->argc], cursor, MAX_ARG_LEN - 1);
+        cmd->argv[cmd->argc][MAX_ARG_LEN - 1] = '\0';
+        ++cmd->argc;
+        return 1;
     }
 }
 
@@ -270,7 +303,8 @@ static int parse_non_negative(const char* text, long* out)
     return 1;
 }
 
-static void handle_command(SOCKET client, HashTable* store, const char* dataFile, Command* cmd)
+static void handle_command(SOCKET client, HashTable* store, const char* dataFile,
+                           const char* authPassword, int* authenticated, Command* cmd)
 {
     const char* command = cmd->argv[0];
     const char* key = cmd->argc > 1 ? cmd->argv[1] : NULL;
@@ -278,7 +312,23 @@ static void handle_command(SOCKET client, HashTable* store, const char* dataFile
 
     uppercase(cmd->argv[0]);
 
-    if (strcmp(command, "PING") == 0 && cmd->argc == 1)
+    if (strcmp(command, "AUTH") == 0 && cmd->argc == 2)
+    {
+        if (authPassword == NULL)
+            resp_send_error(client, "ERR AUTH called without a password configured");
+        else if (strcmp(key, authPassword) != 0)
+            resp_send_error(client, "ERR invalid password");
+        else
+        {
+            *authenticated = 1;
+            resp_send_simple(client, "OK");
+        }
+    }
+    else if (!*authenticated && !(strcmp(command, "QUIT") == 0 && cmd->argc == 1))
+    {
+        resp_send_error(client, "NOAUTH Authentication required.");
+    }
+    else if (strcmp(command, "PING") == 0 && cmd->argc == 1)
     {
         resp_send_simple(client, "PONG");
     }
@@ -466,15 +516,16 @@ static void handle_command(SOCKET client, HashTable* store, const char* dataFile
     else
     {
         resp_send_error(client, "ERR unknown command or wrong number of arguments. "
-                                 "Try: PING, GET <key>, SET <key> <value>, DEL <key>, "
+                                 "Try: AUTH <password>, PING, GET <key>, SET <key> <value>, DEL <key>, "
                                  "EXPIRE <key> <seconds>, TTL <key>, PERSIST <key>, QUIT");
     }
 }
 
-static void serve_client(SOCKET client, HashTable* store, const char* dataFile)
+static void serve_client(SOCKET client, HashTable* store, const char* dataFile, const char* authPassword)
 {
     BufReader reader;
     Command cmd;
+    int authenticated = authPassword == NULL;
 
     br_init(&reader, client);
     for (;;)
@@ -485,7 +536,7 @@ static void serve_client(SOCKET client, HashTable* store, const char* dataFile)
             break;
 
         quitRequested = strcmp(cmd.argv[0], "QUIT") == 0 || strcmp(cmd.argv[0], "quit") == 0;
-        handle_command(client, store, dataFile, &cmd);
+        handle_command(client, store, dataFile, authPassword, &authenticated, &cmd);
         if (quitRequested)
             break;
     }
@@ -501,7 +552,7 @@ static unsigned __stdcall client_thread(void* arg)
     /* Prevents one silent/hung client from tying up its thread forever. */
     setsockopt(ctx->client, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 
-    serve_client(ctx->client, ctx->store, ctx->dataFile);
+    serve_client(ctx->client, ctx->store, ctx->dataFile, ctx->authPassword);
 
     closesocket(ctx->client);
     free(ctx);
@@ -533,6 +584,7 @@ int main(int argc, char* argv[])
 {
     const char* port = argc > 1 ? argv[1] : DEFAULT_PORT;
     const char* dataFile = argc > 2 ? argv[2] : DEFAULT_DATA_FILE;
+    const char* authPassword = argc > 3 && argv[3][0] != '\0' ? argv[3] : NULL;
     WSADATA wsa;
     struct addrinfo hints = { 0 };
     struct addrinfo* address = NULL;
@@ -594,7 +646,8 @@ int main(int argc, char* argv[])
     }
     freeaddrinfo(address);
 
-    printf("kvstore listening on port %s (RESP/TCP); data file: %s\n", port, dataFile);
+    printf("kvstore listening on port %s (RESP/TCP); data file: %s; authentication: %s\n",
+           port, dataFile, authPassword != NULL ? "enabled" : "disabled");
     for (;;)
     {
         SOCKET client = accept(listener, NULL, NULL);
@@ -614,6 +667,7 @@ int main(int argc, char* argv[])
         ctx->client = client;
         ctx->store = store;
         ctx->dataFile = dataFile;
+        ctx->authPassword = authPassword;
 
         threadHandle = (HANDLE)_beginthreadex(NULL, 0, client_thread, ctx, 0, NULL);
         if (threadHandle == NULL)
