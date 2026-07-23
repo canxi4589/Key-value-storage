@@ -7,13 +7,9 @@
 
 #define LOAD_FACTOR 0.7
 
-/* Forward declarations: delete_at() needs to reinsert shifted entries during
-   open-addressing deletion, and ht_insert_internal() needs to trigger a
-   resize, so each is used before the other is defined below. */
 static int ht_insert_internal(HashTable* ht, const char* key, const char* value, long long expireAtMs);
 static int ht_resize(HashTable* ht);
 
-/* djb2 hash function */
 static size_t hash(const char* key, size_t capacity)
 {
     unsigned long h = 5381;
@@ -39,8 +35,6 @@ static char* copy_string(const char* str)
 
 long long ht_current_time_ms(void)
 {
-    /* Second-granularity is all EXPIRE/TTL need, and this avoids pulling in
-       Windows-specific time APIs so hashtable.c stays platform-neutral. */
     return (long long)time(NULL) * 1000;
 }
 
@@ -49,10 +43,6 @@ static int is_expired(const HashNode* node, long long nowMs)
     return node->expireAtMs != 0 && node->expireAtMs <= nowMs;
 }
 
-/* Finds the slot holding key, ignoring expiry. Returns NULL if key isn't in
-   the table at all. Callers are responsible for checking is_expired() on
-   whatever they get back, since "present but expired" and "absent" usually
-   need different handling (lazy deletion vs. a plain miss). */
 static HashNode* find_node(HashTable* ht, const char* key)
 {
     size_t index = hash(key, ht->capacity);
@@ -71,9 +61,7 @@ static HashNode* find_node(HashTable* ht, const char* key)
     return NULL;
 }
 
-/* Frees the slot at index and closes the open-addressing probe chain that
-   follows it, matching the table's original backward-shift deletion
-   algorithm. Assumes ht->table[index].occupied is true on entry. */
+/* Remove a slot and rebuild its following probe chain. */
 static void delete_at(HashTable* ht, size_t index)
 {
     size_t next;
@@ -97,8 +85,6 @@ static void delete_at(HashTable* ht, size_t index)
         ht->table[next].occupied = 0;
         ht->size--;
 
-        /* Preserve the shifted entry's TTL -- this is an internal reshuffle,
-           not a client SET, so it must not reset the key's expiry. */
         ht_insert_internal(ht, temp.key, temp.value, temp.expireAtMs);
         free(temp.key);
         free(temp.value);
@@ -128,8 +114,6 @@ static int ht_resize(HashTable* ht)
         if (!oldTable[i].occupied)
             continue;
 
-        /* Drop already-expired keys here instead of carrying them forward --
-           a resize is a convenient, free opportunity to reclaim that memory. */
         if (is_expired(&oldTable[i], now))
         {
             free(oldTable[i].key);
@@ -251,7 +235,6 @@ static int ht_insert_internal(HashTable* ht, const char* key, const char* value,
 
 int ht_insert(HashTable* ht, const char* key, const char* value)
 {
-    /* Plain SET clears any existing TTL, matching Redis's default behavior. */
     return ht_insert_internal(ht, key, value, 0);
 }
 
@@ -291,8 +274,6 @@ int ht_remove(HashTable* ht, const char* key)
 
     if (is_expired(node, ht_current_time_ms()))
     {
-        /* Already effectively gone -- clean it up, but this DEL didn't
-           "remove" a live key, so report failure like a normal miss. */
         delete_at(ht, (size_t)(node - ht->table));
         return 0;
     }
@@ -367,8 +348,6 @@ size_t ht_sweep_expired(HashTable* ht)
     {
         if (ht->table[i].occupied && is_expired(&ht->table[i], now))
         {
-            /* delete_at() may shift a later probe-chain entry back into slot
-               i, so re-examine the same index rather than advancing past it. */
             delete_at(ht, i);
             ++removed;
             continue;

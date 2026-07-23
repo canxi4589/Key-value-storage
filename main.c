@@ -20,13 +20,10 @@
 #define RECV_TIMEOUT_MS 30000
 #define SWEEP_INTERVAL_MS 1000
 
-#define MAX_ARGS 8            /* Longest command (EXPIRE key seconds) needs 3 */
+#define MAX_ARGS 8
 #define MAX_ARG_LEN 4096
 #define READ_BUF_SIZE 8192
 
-/* Guards all access to the shared HashTable and the AOF data file, since
-   multiple client threads (plus the background sweep thread) may touch them
-   concurrently. */
 static CRITICAL_SECTION g_storeLock;
 
 typedef struct
@@ -37,15 +34,12 @@ typedef struct
     const char* authPassword;
 } ClientContext;
 
-/* A small buffered reader over a socket. RESP parsing needs to read a mix of
-   CRLF-terminated lines and fixed-length byte blocks, so we keep a chunk of
-   already-received bytes around instead of issuing a recv() per byte. */
 typedef struct
 {
     SOCKET sock;
     char buf[READ_BUF_SIZE];
-    int len;   /* valid bytes currently in buf */
-    int pos;   /* next unread byte in buf */
+    int len;
+    int pos;
 } BufReader;
 
 typedef struct
@@ -61,8 +55,6 @@ static void br_init(BufReader* r, SOCKET sock)
     r->pos = 0;
 }
 
-/* Ensures at least one unread byte is available, blocking on recv() if the
-   local buffer is empty. Returns 0 on EOF/error/timeout. */
 static int br_fill(BufReader* r)
 {
     if (r->pos < r->len)
@@ -80,8 +72,6 @@ static int br_read_byte(BufReader* r, char* out)
     return 1;
 }
 
-/* Reads a CRLF-terminated line into out (without the CRLF). Also tolerates a
-   bare '\n', since some simple clients/tools don't send '\r'. */
 static int br_read_line(BufReader* r, char* out, size_t outSize)
 {
     size_t i = 0;
@@ -100,7 +90,7 @@ static int br_read_line(BufReader* r, char* out, size_t outSize)
         }
         out[i++] = c;
     }
-    return 0; /* line too long */
+    return 0;
 }
 
 static int br_read_n(BufReader* r, char* out, size_t n)
@@ -136,11 +126,6 @@ static int send_raw(SOCKET client, const char* data, size_t length)
     }
     return 1;
 }
-
-/* ---- RESP reply helpers -------------------------------------------------
-   See https://redis.io/docs/latest/develop/reference/protocol-spec/ for the
-   wire format. We only need simple strings, errors, bulk strings, and
-   integers. */
 
 static int resp_send_simple(SOCKET client, const char* text)
 {
@@ -184,14 +169,6 @@ static int resp_send_integer(SOCKET client, long long value)
     return send_raw(client, line, (size_t)n);
 }
 
-/* ---- RESP / inline command parsing -------------------------------------- */
-
-/* Reads one command from the connection into cmd. Supports:
-   - RESP arrays of bulk strings: *2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n
-     (this is what redis-cli and every real client library sends)
-   - Inline commands: plain text lines like "PING\r\n" or "SET a b\r\n"
-     (this is what telnet/nc and real Redis's inline protocol use)
-   Returns 0 on disconnect, timeout, protocol error, or too many/long args. */
 static int read_command(BufReader* r, Command* cmd)
 {
     char line[MAX_LINE];
@@ -222,16 +199,13 @@ static int read_command(BufReader* r, Command* cmd)
             if (!br_read_n(r, cmd->argv[i], (size_t)argLen))
                 return 0;
             cmd->argv[i][argLen] = '\0';
-            if (!br_read_n(r, crlf, 2)) /* trailing CRLF after each bulk string */
+            if (!br_read_n(r, crlf, 2))
                 return 0;
         }
         return 1;
     }
 
-    /* Inline commands use whitespace to separate the command and key, but
-       preserve the remainder of the line as one value. This lets
-       "SET greeting hello world" store "hello world". Commands other than
-       SET still reject an unexpected third argument in handle_command(). */
+    /* Preserve the remaining inline text as a value. */
     {
         char* cursor = line;
         int i;
@@ -243,7 +217,6 @@ static int read_command(BufReader* r, Command* cmd)
         if (*cursor == '\0')
             return 0;
 
-        /* Command and key are individual whitespace-delimited tokens. */
         for (i = 0; i < 2; ++i)
         {
             char* start = cursor;
@@ -266,8 +239,6 @@ static int read_command(BufReader* r, Command* cmd)
                 return 1;
         }
 
-        /* The rest of the inline line is the value, including internal and
-           trailing spaces. */
         strncpy(cmd->argv[cmd->argc], cursor, MAX_ARG_LEN - 1);
         cmd->argv[cmd->argc][MAX_ARG_LEN - 1] = '\0';
         ++cmd->argc;
@@ -280,17 +251,12 @@ static int valid_key(const char* key)
     return key != NULL && *key != '\0';
 }
 
-/* Uppercases in place so commands are case-insensitive, matching real Redis
-   ("get", "Get", and "GET" are all the same command). */
 static void uppercase(char* s)
 {
     for (; *s != '\0'; ++s)
         *s = (char)toupper((unsigned char)*s);
 }
 
-/* Parses a non-negative integer (used for EXPIRE's seconds argument).
-   Returns 1 and sets *out on success; returns 0 if text isn't a clean
-   non-negative integer. */
 static int parse_non_negative(const char* text, long* out)
 {
     char* endptr;
@@ -360,14 +326,6 @@ static void handle_command(SOCKET client, HashTable* store, const char* dataFile
         const char* errReply = NULL;
 
         EnterCriticalSection(&g_storeLock);
-        /* Log before mutating, not after: if the AOF write fails, we must not
-           have already changed the in-memory value, or a client could be
-           told SET failed while GET quietly returns the new value anyway --
-           and a crash before the next successful write on this key would
-           then lose it permanently. The only remaining gap is if ht_insert
-           itself fails after a successful log write (essentially only via
-           OOM); that self-heals on the next restart, since replay will
-           reconstruct the value from the log entry that's already durable. */
         if (!aof_append(dataFile, "SET", key, value))
             errReply = "ERR could not persist value";
         else if (!ht_insert(store, key, value))
@@ -402,8 +360,6 @@ static void handle_command(SOCKET client, HashTable* store, const char* dataFile
         if (errReply != NULL)
             resp_send_error(client, errReply);
         else
-            /* Real Redis replies to DEL with the count of keys removed;
-               we only ever delete at most one, so it's 0 or 1. */
             resp_send_integer(client, deleted ? 1 : 0);
     }
     else if (strcmp(command, "EXPIRE") == 0 && cmd->argc == 3 && valid_key(key))
@@ -423,21 +379,12 @@ static void handle_command(SOCKET client, HashTable* store, const char* dataFile
             EnterCriticalSection(&g_storeLock);
             {
                 long long unusedExpiry;
-                /* Existence peek only -- doesn't set anything yet. This also
-                   still lazily expires the key if it's already past due,
-                   which is correct: an expired key has no timeout to set. */
                 exists = ht_get_expiry(store, key, &unusedExpiry);
                 if (exists)
                 {
-                    /* Log before mutating: if this fails, leave the key's
-                       existing TTL (or lack of one) untouched rather than
-                       silently applying a timeout the client was told failed. */
                     if (!aof_log_expire(dataFile, key, expireAtMs))
                         errReply = "ERR could not persist expiry";
                     else
-                        /* Still holding the lock since the peek above, so
-                           nothing else could have removed the key -- this
-                           cannot fail. */
                         ht_set_expiry(store, key, expireAtMs);
                 }
             }
@@ -446,8 +393,6 @@ static void handle_command(SOCKET client, HashTable* store, const char* dataFile
             if (errReply != NULL)
                 resp_send_error(client, errReply);
             else
-                /* Matches real Redis: 1 if the timeout was set, 0 if the key
-                   doesn't exist (or had already expired). */
                 resp_send_integer(client, exists ? 1 : 0);
         }
     }
@@ -462,14 +407,12 @@ static void handle_command(SOCKET client, HashTable* store, const char* dataFile
         LeaveCriticalSection(&g_storeLock);
 
         if (!exists)
-            remainingSeconds = -2; /* key doesn't exist (or just expired) */
+            remainingSeconds = -2;
         else if (expireAtMs == 0)
-            remainingSeconds = -1; /* key exists but has no TTL */
+            remainingSeconds = -1;
         else
         {
             long long remainingMs = expireAtMs - ht_current_time_ms();
-            /* Round up so a key with e.g. 400ms left reports 1s, not 0
-               (0 would misleadingly suggest it's already gone). */
             remainingSeconds = remainingMs > 0 ? (remainingMs + 999) / 1000 : 0;
         }
 
@@ -483,30 +426,24 @@ static void handle_command(SOCKET client, HashTable* store, const char* dataFile
         EnterCriticalSection(&g_storeLock);
         {
             long long expireAtMs;
-            /* Existence + "does it even have a TTL" peek, without mutating. */
             int exists = ht_get_expiry(store, key, &expireAtMs);
 
             if (exists && expireAtMs != 0)
             {
-                /* Log before mutating, same reasoning as SET/EXPIRE. */
                 if (!aof_append(dataFile, "PERSIST", key, NULL))
                     errReply = "ERR could not persist change";
                 else
                 {
-                    ht_persist(store, key); /* cannot fail: still holding the lock */
+                    ht_persist(store, key);
                     changed = 1;
                 }
             }
-            /* If the key doesn't exist, or exists but already has no TTL,
-               there's nothing to change and nothing to log -- matches real
-               Redis's PERSIST, which returns 0 in both of those cases. */
         }
         LeaveCriticalSection(&g_storeLock);
 
         if (errReply != NULL)
             resp_send_error(client, errReply);
         else
-            /* 1 if a TTL was removed, 0 if the key had none (or doesn't exist). */
             resp_send_integer(client, changed ? 1 : 0);
     }
     else if (strcmp(command, "QUIT") == 0 && cmd->argc == 1)
@@ -542,14 +479,11 @@ static void serve_client(SOCKET client, HashTable* store, const char* dataFile, 
     }
 }
 
-/* Thread entry point: one of these runs per connected client, so the accept()
-   loop in main() never blocks waiting on a slow or idle client. */
 static unsigned __stdcall client_thread(void* arg)
 {
     ClientContext* ctx = (ClientContext*)arg;
     DWORD timeout = RECV_TIMEOUT_MS;
 
-    /* Prevents one silent/hung client from tying up its thread forever. */
     setsockopt(ctx->client, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 
     serve_client(ctx->client, ctx->store, ctx->dataFile, ctx->authPassword);
@@ -559,13 +493,6 @@ static unsigned __stdcall client_thread(void* arg)
     return 0;
 }
 
-/* Runs for the lifetime of the process, periodically clearing out keys whose
-   TTL has lapsed. Without this, a key that's set with EXPIRE and never
-   looked up again (so ht_search's lazy expiry never triggers) would sit in
-   memory forever. Sweep-driven removals are deliberately NOT logged to the
-   AOF: since EXPIRE always logs an *absolute* timestamp, replaying the log
-   after a restart reconstructs the key with that same already-past
-   timestamp, so it's cleaned up again almost immediately anyway. */
 static unsigned __stdcall expiry_sweep_thread(void* arg)
 {
     HashTable* store = (HashTable*)arg;
@@ -577,7 +504,7 @@ static unsigned __stdcall expiry_sweep_thread(void* arg)
         ht_sweep_expired(store);
         LeaveCriticalSection(&g_storeLock);
     }
-    return 0; /* unreachable */
+    return 0;
 }
 
 int main(int argc, char* argv[])
@@ -601,12 +528,6 @@ int main(int argc, char* argv[])
 
     InitializeCriticalSection(&g_storeLock);
 
-    /* Compact once at startup: the log has just been fully replayed into
-       memory, so this is a cheap opportunity to collapse whatever redundant
-       or expired history built up before the previous shutdown, keeping the
-       next startup's replay fast too. No other thread exists yet, so this
-       runs without lock contention -- EnterCriticalSection here is just
-       future-proofing in case that ever changes. */
     EnterCriticalSection(&g_storeLock);
     if (!aof_compact(store, dataFile))
         fprintf(stderr, "Warning: startup AOF compaction failed; continuing with existing log.\n");
@@ -619,7 +540,7 @@ int main(int argc, char* argv[])
         ht_destroy(store);
         return 1;
     }
-    CloseHandle(sweepThread); /* runs forever; nothing needs to join it */
+    CloseHandle(sweepThread);
 
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
     {
@@ -660,7 +581,6 @@ int main(int argc, char* argv[])
         ctx = malloc(sizeof(ClientContext));
         if (ctx == NULL)
         {
-            /* Out of memory: reject this connection but keep serving others. */
             closesocket(client);
             continue;
         }
@@ -676,8 +596,6 @@ int main(int argc, char* argv[])
             free(ctx);
             continue;
         }
-        /* Detach: client_thread cleans up its own socket/context, and main()
-           never blocks on it, so we don't need to keep the handle around. */
         CloseHandle(threadHandle);
     }
 }

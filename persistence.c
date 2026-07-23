@@ -59,9 +59,6 @@ static void apply_line(HashTable* store, char* line)
         ht_set_expiry(store, key, atoll(value));
     else if (strcmp(command, "PERSIST") == 0 && value == NULL)
         ht_persist(store, key);
-    /* Any other line (unrecognized command, corrupt/partial entry from a
-       crash mid-write) is silently skipped rather than treated as fatal --
-       matches the original loader's tolerant behavior. */
 }
 
 int aof_load(HashTable* store, const char* dataFile)
@@ -70,7 +67,7 @@ int aof_load(HashTable* store, const char* dataFile)
     char line[MAX_LINE];
 
     if (file == NULL)
-        return 1; /* No data file yet is normal. */
+        return 1;
 
     while (fgets(line, sizeof(line), file) != NULL)
     {
@@ -119,8 +116,6 @@ int aof_compact(HashTable* store, const char* dataFile)
         return 0;
     ctx.ok = 1;
 
-    /* Expired keys are simply never visited by ht_for_each, so they're
-       dropped from the rewritten log for free. */
     ht_for_each(store, write_entry, &ctx);
 
     if (ctx.ok && fflush(ctx.file) != 0)
@@ -136,8 +131,6 @@ int aof_compact(HashTable* store, const char* dataFile)
         return 0;
     }
 
-    /* Atomic replace: a crash here can never leave dataFile half-written or
-       missing -- it's either still the old log or fully the new one. */
     if (!MoveFileExA(tempFile, dataFile, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
     {
         remove(tempFile);
