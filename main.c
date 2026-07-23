@@ -310,10 +310,18 @@ static void handle_command(SOCKET client, HashTable* store, const char* dataFile
         const char* errReply = NULL;
 
         EnterCriticalSection(&g_storeLock);
-        if (!ht_insert(store, key, value))
-            errReply = "ERR out of memory";
-        else if (!aof_append(dataFile, "SET", key, value))
+        /* Log before mutating, not after: if the AOF write fails, we must not
+           have already changed the in-memory value, or a client could be
+           told SET failed while GET quietly returns the new value anyway --
+           and a crash before the next successful write on this key would
+           then lose it permanently. The only remaining gap is if ht_insert
+           itself fails after a successful log write (essentially only via
+           OOM); that self-heals on the next restart, since replay will
+           reconstruct the value from the log entry that's already durable. */
+        if (!aof_append(dataFile, "SET", key, value))
             errReply = "ERR could not persist value";
+        else if (!ht_insert(store, key, value))
+            errReply = "ERR out of memory";
         else
             okReply = "OK";
         LeaveCriticalSection(&g_storeLock);
@@ -363,9 +371,26 @@ static void handle_command(SOCKET client, HashTable* store, const char* dataFile
             const char* errReply = NULL;
 
             EnterCriticalSection(&g_storeLock);
-            exists = ht_set_expiry(store, key, expireAtMs);
-            if (exists && !aof_log_expire(dataFile, key, expireAtMs))
-                errReply = "ERR could not persist expiry";
+            {
+                long long unusedExpiry;
+                /* Existence peek only -- doesn't set anything yet. This also
+                   still lazily expires the key if it's already past due,
+                   which is correct: an expired key has no timeout to set. */
+                exists = ht_get_expiry(store, key, &unusedExpiry);
+                if (exists)
+                {
+                    /* Log before mutating: if this fails, leave the key's
+                       existing TTL (or lack of one) untouched rather than
+                       silently applying a timeout the client was told failed. */
+                    if (!aof_log_expire(dataFile, key, expireAtMs))
+                        errReply = "ERR could not persist expiry";
+                    else
+                        /* Still holding the lock since the peek above, so
+                           nothing else could have removed the key -- this
+                           cannot fail. */
+                        ht_set_expiry(store, key, expireAtMs);
+                }
+            }
             LeaveCriticalSection(&g_storeLock);
 
             if (errReply != NULL)
@@ -402,13 +427,30 @@ static void handle_command(SOCKET client, HashTable* store, const char* dataFile
     }
     else if (strcmp(command, "PERSIST") == 0 && cmd->argc == 2 && valid_key(key))
     {
-        int changed;
+        int changed = 0;
         const char* errReply = NULL;
 
         EnterCriticalSection(&g_storeLock);
-        changed = ht_persist(store, key);
-        if (changed && !aof_append(dataFile, "PERSIST", key, NULL))
-            errReply = "ERR could not persist change";
+        {
+            long long expireAtMs;
+            /* Existence + "does it even have a TTL" peek, without mutating. */
+            int exists = ht_get_expiry(store, key, &expireAtMs);
+
+            if (exists && expireAtMs != 0)
+            {
+                /* Log before mutating, same reasoning as SET/EXPIRE. */
+                if (!aof_append(dataFile, "PERSIST", key, NULL))
+                    errReply = "ERR could not persist change";
+                else
+                {
+                    ht_persist(store, key); /* cannot fail: still holding the lock */
+                    changed = 1;
+                }
+            }
+            /* If the key doesn't exist, or exists but already has no TTL,
+               there's nothing to change and nothing to log -- matches real
+               Redis's PERSIST, which returns 0 in both of those cases. */
+        }
         LeaveCriticalSection(&g_storeLock);
 
         if (errReply != NULL)
